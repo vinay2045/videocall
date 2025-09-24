@@ -38,7 +38,7 @@ a { color: #53bdeb; text-decoration: none; }
 /* Main */
 .main { position: relative; overflow: hidden; }
 .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; padding: 12px; height: 100%; overflow-y: auto; }
-.call-tile { background: #111b21; border: 1px solid #233138; border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; width: 1000px; }
+.call-tile { background: #111b21; border: 1px solid #233138; border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }
 .call-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; background: #0b141a; border-bottom: 1px solid #233138; }
 .call-title { font-size: 14px; color: #aebac1; }
 .call-controls { display: flex; gap: 8px; }
