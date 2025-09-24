@@ -166,7 +166,15 @@ app.get('/ice', async (req, res) => {
     }
     let parsed;
     try { parsed = JSON.parse(payload.data); } catch { parsed = null; }
-    const iceServers = parsed?.v?.iceServers || parsed?.iceServers || parsed?.d || [];
+    let iceServers = parsed?.v?.iceServers || parsed?.iceServers || parsed?.d || [];
+    // Xirsys sometimes returns an object: { username, credential, urls: [] }
+    if (!Array.isArray(iceServers) && iceServers && typeof iceServers === 'object') {
+      iceServers = [{
+        urls: iceServers.urls || [],
+        username: iceServers.username,
+        credential: iceServers.credential
+      }];
+    }
     if (!Array.isArray(iceServers) || iceServers.length === 0) {
       console.error('Xirsys malformed response:', payload.data);
       return res.status(502).json({ error: 'No ICE servers returned' });

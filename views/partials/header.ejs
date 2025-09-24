@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title><%= title || 'Video Call App' %></title>
+  <title><%= (typeof title !== 'undefined' ? title : 'Video Call App') %></title>
   <link rel="stylesheet" href="/css/styles.css" />
   <!-- LiveKit client (UMD) for SFU-based low-latency calls -->
   <script src="https://unpkg.com/livekit-client/dist/livekit-client.umd.min.js"></script>
