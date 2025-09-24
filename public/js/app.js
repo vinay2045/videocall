@@ -32,6 +32,45 @@
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
     }
+    window.removeEventListener('beforeunload', arguments.callee);
+  });
+
+  // SDP munging to improve latency and echo resilience
+  function tuneSDP(sdp) {
+    try {
+      const lines = sdp.split(/\r?\n/);
+      const ptToCodec = new Map();
+      for (const l of lines) {
+        const m = l.match(/^a=rtpmap:(\d+)\s+([^\/]+)/i);
+        if (m) ptToCodec.set(m[1], m[2].toLowerCase());
+      }
+      for (let i = 0; i < lines.length; i++) {
+        const l = lines[i];
+        const m = l.match(/^a=fmtp:(\d+)\s*(.*)$/i);
+        if (!m) continue;
+        const pt = m[1];
+        const codec = ptToCodec.get(pt) || '';
+        const params = m[2] ? m[2].split(';').map(s=>s.trim()).filter(Boolean) : [];
+        const pushIfMissing = (k,v) => { if (!params.some(p=>p.toLowerCase().startsWith(k+'='))) params.push(`${k}=${v}`); };
+        if (codec.includes('opus')) {
+          pushIfMissing('stereo','0');
+          pushIfMissing('sprop-stereo','0');
+          pushIfMissing('maxaveragebitrate','24000');
+          pushIfMissing('useinbandfec','1');
+          pushIfMissing('usedtx','1');
+          pushIfMissing('ptime','20');
+          lines[i] = `a=fmtp:${pt} ${params.join(';')}`;
+        } else if (codec.includes('vp8') || codec.includes('h264')) {
+          pushIfMissing('x-google-start-bitrate','1200');
+          pushIfMissing('x-google-max-bitrate','1500');
+          pushIfMissing('x-google-min-bitrate','300');
+          pushIfMissing('x-google-max-framerate','30');
+          lines[i] = `a=fmtp:${pt} ${params.join(';')}`;
+        }
+      }
+      return lines.join('\r\n');
+    } catch(_){ return sdp; }
+  }
 
   // Adapt bitrate/framerate based on live stats
   function startAdaptiveController(pc) {
@@ -131,8 +170,19 @@
       }
       console.log('[media] Requesting user media (video+audio)');
       localStream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30, max: 30 }
+        },
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000,
+          sampleSize: 16
+        }
       });
       // Ensure audio tracks are enabled
       try {
@@ -706,6 +756,8 @@
         ensureRecvOnly(pc);
         offer = await pc.createOffer();
       }
+      // SDP munging for low-latency Opus/Video
+      offer.sdp = tuneSDP(offer.sdp);
       console.log('[webrtc] setLocalDescription(offer)');
       await pc.setLocalDescription(offer);
       console.log('[signal] emit call-user ->', peerUser._id);
@@ -731,7 +783,9 @@
       console.log('[webrtc] setRemoteDescription(offer) from', fromUserId);
       await pc.setRemoteDescription(offer);
       await addLocalTracks(pc);
-      const answer = await pc.createAnswer();
+      let answer = await pc.createAnswer();
+      // SDP munging for low-latency Opus/Video
+      answer.sdp = tuneSDP(answer.sdp);
       console.log('[webrtc] setLocalDescription(answer)');
       await pc.setLocalDescription(answer);
       console.log('[signal] emit answer-call ->', fromUserId);
