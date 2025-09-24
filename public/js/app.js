@@ -32,10 +32,62 @@
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
     }
+
+  // Adapt bitrate/framerate based on live stats
+  function startAdaptiveController(pc) {
+    try {
+      if (!pc.getSenders) return;
+      const videoSenders = pc.getSenders().filter(s => s.track && s.track.kind === 'video');
+      if (videoSenders.length === 0) return;
+      let level = 3; // 3:1200kbps@30fps, 2:900@24, 1:600@24, 0:300@15
+      const apply = async () => {
+        for (const s of videoSenders) {
+          try {
+            const p = s.getParameters();
+            p.encodings = p.encodings || [{}];
+            const e = p.encodings[0];
+            if (level >= 3) { e.maxBitrate = 1200*1000; e.maxFramerate = 30; }
+            else if (level === 2) { e.maxBitrate = 900*1000; e.maxFramerate = 24; }
+            else if (level === 1) { e.maxBitrate = 600*1000; e.maxFramerate = 24; }
+            else { e.maxBitrate = 300*1000; e.maxFramerate = 15; }
+            await s.setParameters(p);
+          } catch(_){}
+        }
+      };
+      apply();
+
+      let improvingTicks = 0, degradingTicks = 0;
+      const t = setInterval(async () => {
+        if (pc.connectionState !== 'connected') return;
+        try {
+          const stats = await pc.getStats();
+          const pair = [...stats.values()].find(s => s.type==='candidate-pair' && s.nominated);
+          const rtt = pair?.currentRoundTripTime || 0;
+          const inVideo = [...stats.values()].find(s => s.type==='inbound-rtp' && s.kind==='video');
+          const lossRatio = inVideo && inVideo.packetsReceived ? (inVideo.packetsLost||0) / inVideo.packetsReceived : 0;
+          const fps = inVideo?.framesPerSecond || 0;
+
+          // Degrade if RTT>300ms or loss>3% or FPS<15
+          if (rtt > 0.3 || lossRatio > 0.03 || fps < 15) { degradingTicks++; improvingTicks = 0; }
+          else { improvingTicks++; degradingTicks = 0; }
+
+          if (degradingTicks >= 2 && level > 0) { level--; degradingTicks = 0; apply(); }
+          if (improvingTicks >= 10 && level < 3) { level++; improvingTicks = 0; apply(); }
+        } catch(_){}
+      }, 1000);
+
+      // Stop when closed
+      const stop = () => clearInterval(t);
+      const origClose = pc.close.bind(pc);
+      pc.close = () => { try { stop(); } catch(_){} origClose(); };
+    } catch(_){}
+  }
   });
 
   // STUN servers for ICE
   const rtcConfig = {
+    bundlePolicy: 'max-bundle',
+    iceCandidatePoolSize: 2,
     iceServers: [
       { urls: [
         'stun:stun.l.google.com:19302',
@@ -400,9 +452,69 @@
           const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
           const overlay = tile.querySelector('.tap-to-start');
           if (isMobile && overlay) overlay.classList.remove('hidden');
+          // Start lightweight stats logger to diagnose latency/jitter
+          startStatsLogger(pc, peerUserId);
+          // Start adaptive controller
+          startAdaptiveController(pc);
         }
       }
     };
+
+    // If we drop to disconnected/failed for >2s, try ICE restart
+    let disconnectTimer = null;
+    pc.oniceconnectionstatechange = () => {
+      const st = pc.iceConnectionState;
+      if (st === 'disconnected' || st === 'failed') {
+        if (!disconnectTimer) {
+          disconnectTimer = setTimeout(async () => {
+            try {
+              console.warn('[webrtc] ICE restart due to', st);
+              const offer = await pc.createOffer({ iceRestart: true });
+              await pc.setLocalDescription(offer);
+              // Re-signal depending on who initiated
+              const peerId = peerUserId;
+              if (peers.get(peerId)) {
+                socket.emit('call-user', { toUserId: peerId, offer });
+              }
+            } catch (e) {
+              console.warn('[webrtc] ICE restart error', e && (e.name + ': ' + e.message));
+            }
+            disconnectTimer = null;
+          }, 2000);
+        }
+      } else if (st === 'connected' || st === 'completed') {
+        if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
+      }
+    };
+
+    function startStatsLogger(pc, peerId) {
+      try {
+        if (!pc.getStats) return;
+        let ticks = 0;
+        const interval = setInterval(async () => {
+          if (pc.connectionState !== 'connected' || ticks++ > 60) { clearInterval(interval); return; }
+          try {
+            const stats = await pc.getStats();
+            let outAudio, outVideo, inAudio, inVideo;
+            stats.forEach(r => {
+              if (r.type === 'outbound-rtp' && r.kind === 'audio') outAudio = r;
+              if (r.type === 'outbound-rtp' && r.kind === 'video') outVideo = r;
+              if (r.type === 'inbound-rtp' && r.kind === 'audio') inAudio = r;
+              if (r.type === 'inbound-rtp' && r.kind === 'video') inVideo = r;
+            });
+            if (ticks % 10 === 0) {
+              console.log('[stats]', peerId, {
+                rtt: [...stats.values()].find(s=>s.type==='candidate-pair'&&s.nominated)?.currentRoundTripTime,
+                outA_bps: outAudio && outAudio.bitrateMean,
+                outV_bps: outVideo && outVideo.bitrateMean,
+                inA_jitter: inAudio && inAudio.jitter,
+                inV_frames: inVideo && inVideo.framesPerSecond
+              });
+            }
+          } catch(_){}
+        }, 1000);
+      } catch(_){}
+    }
 
     pc.onnegotiationneeded = async () => {
       console.log('[webrtc] negotiationneeded for', peerUserId);
@@ -435,7 +547,59 @@
         ensureRecvOnly(pc);
         return;
       }
-      tracks.forEach(track => pc.addTrack(track, stream));
+      tracks.forEach(track => {
+        // Content hints help the encoder pick settings
+        try {
+          if (track.kind === 'video' && 'contentHint' in track) track.contentHint = 'motion';
+          if (track.kind === 'audio' && 'contentHint' in track) track.contentHint = 'speech';
+        } catch(_){}
+        const sender = pc.addTrack(track, stream);
+        // Tune sender encodings for low latency
+        try {
+          const params = sender.getParameters();
+          params.degradationPreference = 'balanced';
+          params.encodings = params.encodings || [{}];
+          const enc = params.encodings[0];
+          if (track.kind === 'video') {
+            // ~1.2Mbps cap, 30fps
+            if (enc.maxBitrate == null) enc.maxBitrate = 1200 * 1000;
+            if (enc.maxFramerate == null) enc.maxFramerate = 30;
+            // Prefer temporal scalability if available
+            if (enc.scalabilityMode == null) enc.scalabilityMode = 'L1T2';
+          } else if (track.kind === 'audio') {
+            // Opus DTX lowers jitter/latency in silence
+            if (enc.dtx == null) enc.dtx = true;
+          }
+          sender.setParameters(params).catch(()=>{});
+        } catch (e) {
+          console.warn('[webrtc] setParameters not supported', e && (e.name + ': ' + e.message));
+        }
+      });
+
+      // Prefer codecs when supported (Opus/VP8 widely compatible; H264-first on iOS Safari)
+      try {
+        if (pc.getTransceivers) {
+          pc.getTransceivers().forEach(tr => {
+            if (!tr.setCodecPreferences || !RTCRtpReceiver.getCapabilities) return;
+            const caps = RTCRtpReceiver.getCapabilities(tr.receiver.track.kind);
+            if (!caps) return;
+            const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+            let preferred = caps.codecs;
+            if (tr.receiver.track.kind === 'audio') {
+              preferred = caps.codecs.filter(c => /opus/i.test(c.mimeType)).concat(caps.codecs.filter(c => !/opus/i.test(c.mimeType)));
+            } else {
+              if (isIOS) {
+                preferred = caps.codecs.filter(c => /H264/i.test(c.mimeType)).concat(caps.codecs.filter(c => !/H264/i.test(c.mimeType)));
+              } else {
+                preferred = caps.codecs.filter(c => /VP8/i.test(c.mimeType)).concat(caps.codecs.filter(c => !/VP8/i.test(c.mimeType)));
+              }
+            }
+            if (preferred && preferred.length) tr.setCodecPreferences(preferred);
+          });
+        }
+      } catch (e) {
+        console.warn('[webrtc] codec preference not applied', e && (e.name + ': ' + e.message));
+      }
     } catch (e) {
       console.warn('[media] Could not get local media, using recvonly transceivers', e && (e.name + ': ' + e.message));
       ensureRecvOnly(pc);
