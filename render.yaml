@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: videocall
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGO_URI
+        # Set this in the Render dashboard after deploy; e.g. MongoDB Atlas URI
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true

@@ -1,0 +1,15 @@
+<nav class="navbar">
+  <div class="navbar-left">
+    <div class="app-title">ChatCall</div>
+  </div>
+  <div class="navbar-right">
+    <div class="user-info">
+      <span class="user-name"><%= user ? user.name : '' %> (<%= user ? user.role : '' %>)</span>
+    </div>
+    <% if (user) { %>
+    <form action="/auth/logout" method="POST" class="logout-form">
+      <button type="submit" class="btn btn-logout">Logout</button>
+    </form>
+    <% } %>
+  </div>
+</nav>
