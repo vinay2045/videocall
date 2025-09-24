@@ -110,7 +110,6 @@
 
     return true;
   }
-    window.removeEventListener('beforeunload', arguments.callee);
   });
 
   // SDP munging to improve latency and echo resilience
@@ -817,8 +816,11 @@
         console.log('Already calling this user');
         return;
       }
-      // Try LiveKit first
-      const livekitOk = await startCallLiveKit(peerUser);
+      // Try LiveKit first (if available)
+      let livekitOk = false;
+      if (typeof startCallLiveKit === 'function') {
+        livekitOk = await startCallLiveKit(peerUser);
+      }
       if (!livekitOk) {
         const tile = ensureCallTile(peerUser);
         unlockAudio();
