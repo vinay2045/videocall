@@ -120,8 +120,8 @@
       const origClose = pc.close.bind(pc);
       pc.close = () => { try { stop(); } catch(_){} origClose(); };
     } catch(_){}
+
   }
-  });
 
   // ICE configuration: default STUN + dynamic TURN from /ice
   const defaultStun = [
