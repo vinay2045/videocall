@@ -86,3 +86,65 @@ initSocket(io);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+
+// --- ICE (Xirsys) proxy endpoint ---
+// Avoid exposing TURN credentials to the client bundle; fetch at runtime server-side
+const https = require('https');
+let cachedIce = { stamp: 0, data: null };
+
+app.get('/ice', async (req, res) => {
+  try {
+    // Cache for 5 minutes
+    if (cachedIce.data && (Date.now() - cachedIce.stamp < 5 * 60 * 1000)) {
+      return res.json({ iceServers: cachedIce.data });
+    }
+
+    const X_HOST = process.env.XIRSYS_HOST || 'global.xirsys.net';
+    const X_PATH = process.env.XIRSYS_PATH || '/_turn/MyFirstApp';
+    const X_IDENT = process.env.XIRSYS_IDENT; // username
+    const X_SECRET = process.env.XIRSYS_SECRET; // secret/API key
+    if (!X_IDENT || !X_SECRET) {
+      return res.status(500).json({ error: 'XIRSYS credentials not configured' });
+    }
+
+    const body = JSON.stringify({ format: 'urls' });
+    const options = {
+      host: X_HOST,
+      path: X_PATH,
+      method: 'PUT',
+      headers: {
+        'Authorization': 'Basic ' + Buffer.from(`${X_IDENT}:${X_SECRET}`).toString('base64'),
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+
+    const payload = await new Promise((resolve, reject) => {
+      const req2 = https.request(options, (r) => {
+        let data = '';
+        r.on('data', (ch) => data += ch);
+        r.on('end', () => resolve({ status: r.statusCode, data }));
+      });
+      req2.on('error', reject);
+      req2.write(body);
+      req2.end();
+    });
+
+    if (payload.status !== 200) {
+      console.error('Xirsys error status:', payload.status, payload.data);
+      return res.status(502).json({ error: 'Failed to fetch ICE from Xirsys' });
+    }
+    let parsed;
+    try { parsed = JSON.parse(payload.data); } catch { parsed = null; }
+    const iceServers = parsed?.v?.iceServers || parsed?.iceServers || parsed?.d || [];
+    if (!Array.isArray(iceServers) || iceServers.length === 0) {
+      console.error('Xirsys malformed response:', payload.data);
+      return res.status(502).json({ error: 'No ICE servers returned' });
+    }
+    cachedIce = { stamp: Date.now(), data: iceServers };
+    return res.json({ iceServers });
+  } catch (e) {
+    console.error('ICE endpoint error:', e);
+    return res.status(500).json({ error: 'ICE endpoint failed' });
+  }
+});

@@ -84,22 +84,37 @@
   }
   });
 
-  // STUN servers for ICE
-  const rtcConfig = {
-    bundlePolicy: 'max-bundle',
-    iceCandidatePoolSize: 2,
-    iceServers: [
-      { urls: [
-        'stun:stun.l.google.com:19302',
-        'stun:stun1.l.google.com:19302',
-        'stun:stun2.l.google.com:19302',
-        'stun:stun3.l.google.com:19302',
-        'stun:stun4.l.google.com:19302'
-      ] }
-      // If you add TURN, use a valid turn: URL from your provider, e.g.
-      // { urls: 'turn:your.turn.server:3478', username: 'user', credential: 'pass' }
-    ]
-  };
+  // ICE configuration: default STUN + dynamic TURN from /ice
+  const defaultStun = [
+    { urls: [
+      'stun:stun.l.google.com:19302',
+      'stun:stun1.l.google.com:19302',
+      'stun:stun2.l.google.com:19302',
+      'stun:stun3.l.google.com:19302',
+      'stun:stun4.l.google.com:19302'
+    ]}
+  ];
+  let dynamicIce = [];
+  async function loadIce() {
+    try {
+      const resp = await fetch('/ice');
+      if (!resp.ok) throw new Error('ice fetch ' + resp.status);
+      const data = await resp.json();
+      if (Array.isArray(data.iceServers)) {
+        dynamicIce = data.iceServers;
+        console.log('[ice] Loaded', dynamicIce);
+      }
+    } catch (e) {
+      console.warn('[ice] Using default STUN only', e && (e.name + ': ' + e.message));
+    }
+  }
+  function getRtcConfig() {
+    return {
+      bundlePolicy: 'max-bundle',
+      iceCandidatePoolSize: 2,
+      iceServers: [...defaultStun, ...dynamicIce]
+    };
+  }
 
   // Initialize media (re-acquire if existing tracks are ended)
   async function ensureLocalStream() {
@@ -363,7 +378,7 @@
 
   // WebRTC helpers
   function createPeerConnection(peerUserId) {
-    const pc = new RTCPeerConnection(rtcConfig);
+    const pc = new RTCPeerConnection(getRtcConfig());
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
@@ -774,6 +789,8 @@
 
   // Socket wiring
   socket.on('connect', () => {
+    // Ensure ICE (TURN) is loaded as soon as we connect
+    loadIce();
     socket.emit('presence:refresh');
     fetchUsersAndRender();
   });
@@ -791,5 +808,6 @@
   socket.on('call-ended', handleCallEnded);
 
   // Initial load
+  loadIce();
   fetchUsersAndRender();
 })();
