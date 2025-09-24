@@ -21,6 +21,7 @@
   const incomingPrompts = new Map(); // userId -> DOM element
   const peerAudioNodes = new Map(); // userId -> MediaStreamAudioSourceNode
   let audioCtx = null;
+  const livekitRooms = new Map(); // userId -> LiveKit Room
 
   // Ensure at least one user gesture unlocks audio context globally
   document.addEventListener('click', () => {
@@ -32,6 +33,83 @@
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
     }
+
+  // ---------- LiveKit (optional) ----------
+  function makeRoomName(a, b) {
+    const [x, y] = [String(a), String(b)].sort();
+    return `room-${x}-${y}`;
+  }
+
+  async function tryGetLiveKitToken(room) {
+    if (!window.LivekitClient) return null;
+    try {
+      const r = await fetch(`/lk/token?room=${encodeURIComponent(room)}`);
+      if (!r.ok) return null;
+      return await r.json(); // {url, token}
+    } catch(_) { return null; }
+  }
+
+  async function startCallLiveKit(peerUser) {
+    const roomName = makeRoomName(currentUser._id, peerUser._id);
+    const creds = await tryGetLiveKitToken(roomName);
+    if (!creds) return false; // signal to fallback
+
+    const tile = ensureCallTile(peerUser);
+    await attachLocalStreamToTile(tile);
+
+    const { connect, RoomEvent } = window.LivekitClient;
+    let room;
+    try {
+      room = await connect(creds.url, creds.token, { autoSubscribe: true });
+    } catch (e) {
+      console.warn('[livekit] connect failed', e && (e.name + ': ' + e.message));
+      return false;
+    }
+
+    livekitRooms.set(peerUser._id, room);
+
+    // Publish local tracks if we have them
+    try {
+      if (localStream) {
+        for (const track of localStream.getTracks()) {
+          await room.localParticipant.publishTrack(track);
+        }
+      }
+    } catch (e) {
+      console.warn('[livekit] publish error', e && (e.name + ': ' + e.message));
+    }
+
+    const tileEl = document.querySelector(`.call-tile[data-user-id="${peerUser._id}"]`);
+    const remoteVideoEl = tileEl && tileEl.querySelector('video[data-kind="remote"]');
+    const remoteAudioEl = tileEl && tileEl.querySelector('audio[data-kind="remote-audio"]');
+
+    const attach = (track) => {
+      if (!track) return;
+      if (track.kind === 'video' && remoteVideoEl) {
+        track.attach(remoteVideoEl);
+        safePlay(remoteVideoEl);
+      }
+      if (track.kind === 'audio' && remoteAudioEl) {
+        track.attach(remoteAudioEl);
+        remoteAudioEl.muted = false;
+        safePlay(remoteAudioEl);
+      }
+    };
+
+    room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
+      attach(track);
+    });
+    room.on(RoomEvent.TrackPublished, async (pub, participant) => {
+      try {
+        const track = pub.track; if (track) attach(track);
+      } catch(_){}
+    });
+    room.on(RoomEvent.Disconnected, () => {
+      livekitRooms.delete(peerUser._id);
+    });
+
+    return true;
+  }
     window.removeEventListener('beforeunload', arguments.callee);
   });
 
@@ -739,29 +817,32 @@
         console.log('Already calling this user');
         return;
       }
+      // Try LiveKit first
+      const livekitOk = await startCallLiveKit(peerUser);
+      if (!livekitOk) {
+        const tile = ensureCallTile(peerUser);
+        unlockAudio();
+        await attachLocalStreamToTile(tile);
 
-      const tile = ensureCallTile(peerUser);
-      unlockAudio();
-      await attachLocalStreamToTile(tile);
+        const pc = createPeerConnection(peerUser._id);
+        await addLocalTracks(pc);
 
-      const pc = createPeerConnection(peerUser._id);
-      await addLocalTracks(pc);
-
-      console.log('[webrtc] creating offer ->', peerUser._id);
-      let offer;
-      try {
-        offer = await pc.createOffer();
-      } catch (err) {
-        console.warn('[webrtc] createOffer failed once, ensuring recvonly transceivers then retry. Error:', err && (err.name + ': ' + err.message));
-        ensureRecvOnly(pc);
-        offer = await pc.createOffer();
+        console.log('[webrtc] creating offer ->', peerUser._id);
+        let offer;
+        try {
+          offer = await pc.createOffer();
+        } catch (err) {
+          console.warn('[webrtc] createOffer failed once, ensuring recvonly transceivers then retry. Error:', err && (err.name + ': ' + err.message));
+          ensureRecvOnly(pc);
+          offer = await pc.createOffer();
+        }
+        // SDP munging for low-latency Opus/Video
+        offer.sdp = tuneSDP(offer.sdp);
+        console.log('[webrtc] setLocalDescription(offer)');
+        await pc.setLocalDescription(offer);
+        console.log('[signal] emit call-user ->', peerUser._id);
+        socket.emit('call-user', { toUserId: peerUser._id, offer });
       }
-      // SDP munging for low-latency Opus/Video
-      offer.sdp = tuneSDP(offer.sdp);
-      console.log('[webrtc] setLocalDescription(offer)');
-      await pc.setLocalDescription(offer);
-      console.log('[signal] emit call-user ->', peerUser._id);
-      socket.emit('call-user', { toUserId: peerUser._id, offer });
     } catch (e) {
       console.error('[call] startCall error', e && (e.name + ': ' + e.message));
       alert('Failed to start call. ' + (e && e.name ? '(' + e.name + ')' : ''));
@@ -773,6 +854,15 @@
     try {
       // Find user object for tile labels
       const peerUser = usersCache.find(u => u._id === fromUserId) || { _id: fromUserId, name: fromName };
+      // If caller is using LiveKit, we may not get offer over socket.
+      // Try joining LiveKit room proactively (same naming scheme) and if that fails, proceed with P2P answer.
+      const lkCreds = await tryGetLiveKitToken(makeRoomName(currentUser._id, fromUserId));
+      if (lkCreds) {
+        // Callee joins same room; publish/sub automatically via LiveKit
+        const ok = await startCallLiveKit(peerUser);
+        if (ok) return;
+      }
+
       const tile = ensureCallTile(peerUser);
       await attachLocalStreamToTile(tile);
 
@@ -827,6 +917,11 @@
       peers.delete(peerUserId);
     }
     remoteStreams.delete(peerUserId);
+    const lk = livekitRooms.get(peerUserId);
+    if (lk) {
+      try { lk.disconnect(); } catch(_){}
+      livekitRooms.delete(peerUserId);
+    }
     deleteCallTile(peerUserId);
     socket.emit('end-call', { toUserId: peerUserId, reason: reason || 'ended' });
   }

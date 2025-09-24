@@ -38,6 +38,36 @@ const sessionMiddleware = session({
   }
 });
 
+// --- LiveKit token endpoint ---
+// Returns { url, token } for the given room and the current session user identity
+try {
+  const { AccessToken } = require('livekit-server-sdk');
+  app.get('/lk/token', (req, res) => {
+    try {
+      const url = process.env.LIVEKIT_URL;
+      const apiKey = process.env.LIVEKIT_API_KEY;
+      const apiSecret = process.env.LIVEKIT_API_SECRET;
+      if (!url || !apiKey || !apiSecret) {
+        return res.status(500).json({ error: 'LiveKit env not configured' });
+      }
+      const roomName = (req.query.room || '').toString().slice(0, 128) || 'default';
+      const identity = (req.session?.user?.name || req.session?.user?._id || 'guest') + '-' + (req.session.id || Math.random().toString(36).slice(2));
+      const at = new AccessToken(apiKey, apiSecret, {
+        identity,
+        ttl: '10m'
+      });
+      at.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true });
+      const token = at.toJwt();
+      return res.json({ url, token, identity, room: roomName });
+    } catch (e) {
+      console.error('livekit token error', e);
+      return res.status(500).json({ error: 'token_failed' });
+    }
+  });
+} catch (e) {
+  console.warn('[livekit] server sdk not installed, /lk/token disabled');
+}
+
 // Middleware
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
