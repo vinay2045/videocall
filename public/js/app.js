@@ -19,6 +19,20 @@
   let localStream = null; // MediaStream
   let usersCache = []; // fetched users
   const incomingPrompts = new Map(); // userId -> DOM element
+  const peerAudioNodes = new Map(); // userId -> MediaStreamAudioSourceNode
+  let audioCtx = null;
+
+  // Ensure at least one user gesture unlocks audio context globally
+  document.addEventListener('click', () => {
+    try { unlockAudio(); } catch(_){}
+  }, { once: true });
+
+  // Release media on page unload to allow other browsers to access devices
+  window.addEventListener('beforeunload', () => {
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+    }
+  });
 
   // STUN servers for ICE
   const rtcConfig = {
@@ -38,18 +52,35 @@
   // Initialize media (re-acquire if existing tracks are ended)
   async function ensureLocalStream() {
     try {
+      // Require secure context on mobile for camera/mic
+      const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+      if (!window.isSecureContext && isMobile) {
+        throw new Error('SECURE_CONTEXT_REQUIRED');
+      }
       if (localStream) {
         const allEnded = localStream.getTracks().every(t => t.readyState === 'ended');
         if (!allEnded) return localStream;
         console.warn('[media] Existing localStream tracks ended; re-acquiring media');
       }
       console.log('[media] Requesting user media (video+audio)');
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+      // Ensure audio tracks are enabled
+      try {
+        localStream.getAudioTracks().forEach(t => t.enabled = true);
+      } catch(_){}
       console.log('[media] Got user media');
       return localStream;
     } catch (err) {
-      console.error('[media] Failed to get user media:', err && (err.name + ': ' + err.message));
-      alert('Could not access camera/microphone (' + (err && err.name ? err.name : 'Error') + '). Please allow permissions and try again.');
+      if (err && err.message === 'SECURE_CONTEXT_REQUIRED') {
+        console.error('[media] getUserMedia blocked: insecure context on mobile');
+        alert('Camera/mic require HTTPS on mobile. Use the Render URL or an HTTPS tunnel (e.g., ngrok) instead of http://LAN-IP:3000');
+      } else {
+        console.error('[media] Failed to get user media:', err && (err.name + ': ' + err.message));
+        alert('Could not access camera/microphone (' + (err && err.name ? err.name : 'Error') + '). Please allow permissions and try again.');
+      }
       throw err;
     }
   }
@@ -123,16 +154,29 @@
 
     const title = document.createElement('div');
     title.className = 'call-title';
-    title.textContent = `Call with ${peerUser.name}`;
+    title.textContent = `Call with ${peerUser.name}${peerUser.role ? ' (' + peerUser.role + ')' : ''}`;
 
     const controls = document.createElement('div');
     controls.className = 'call-controls';
+
+    const muteBtn = document.createElement('button');
+    muteBtn.className = 'btn';
+    muteBtn.textContent = 'Mute';
+    muteBtn.dataset.state = 'unmuted';
+    muteBtn.addEventListener('click', () => toggleMute(muteBtn));
+
+    const speakerBtn = document.createElement('button');
+    speakerBtn.className = 'btn';
+    speakerBtn.textContent = 'Speaker On';
+    speakerBtn.addEventListener('click', () => toggleSpeaker(peerUser._id, speakerBtn));
 
     const endBtn = document.createElement('button');
     endBtn.className = 'end-call';
     endBtn.textContent = 'End';
     endBtn.addEventListener('click', () => endCall(peerUser._id, 'hangup'));
 
+    controls.appendChild(speakerBtn);
+    controls.appendChild(muteBtn);
     controls.appendChild(endBtn);
     header.appendChild(title);
     header.appendChild(controls);
@@ -147,30 +191,117 @@
     localVideo.dataset.kind = 'local';
     const localLbl = document.createElement('div');
     localLbl.className = 'video-label';
-    localLbl.textContent = `${currentUser.name} (You)`;
+    localLbl.textContent = `${currentUser.name} (${currentUser.role || ''}) (You)`;
     leftWrap.appendChild(localVideo);
     leftWrap.appendChild(localLbl);
 
     const rightWrap = document.createElement('div');
     rightWrap.className = 'video-wrapper';
     const remoteVideo = document.createElement('video');
-    remoteVideo.autoplay = true; remoteVideo.playsInline = true;
+    remoteVideo.autoplay = true; remoteVideo.playsInline = true; remoteVideo.muted = false; remoteVideo.volume = 1.0;
     remoteVideo.dataset.kind = 'remote';
+    const remoteAudio = document.createElement('audio');
+    remoteAudio.autoplay = true; remoteAudio.dataset.kind = 'remote-audio'; remoteAudio.volume = 1.0; remoteAudio.controls = false; remoteAudio.style.display = 'none';
     const remoteLbl = document.createElement('div');
     remoteLbl.className = 'video-label';
-    remoteLbl.textContent = `${peerUser.name}`;
+    remoteLbl.textContent = `${peerUser.name}${peerUser.role ? ' (' + peerUser.role + ')' : ''}`;
     rightWrap.appendChild(remoteVideo);
+    remoteVideo.addEventListener('loadedmetadata', () => safePlay(remoteVideo));
     rightWrap.appendChild(remoteLbl);
+    // Hidden audio element to ensure audio plays even if video element is blocked
+    tile.appendChild(remoteAudio);
 
     panes.appendChild(leftWrap);
     panes.appendChild(rightWrap);
 
+    // Mobile tap-to-start overlay
+    const tapOverlay = document.createElement('div');
+    tapOverlay.className = 'tap-to-start hidden';
+    tapOverlay.textContent = 'Tap to start audio/video';
+    tapOverlay.addEventListener('click', () => {
+      unlockAudio();
+      const a = tile.querySelector('audio[data-kind="remote-audio"]');
+      const v = tile.querySelector('video[data-kind="remote"]');
+      if (a) { a.muted = false; safePlay(a); }
+      if (v) { safePlay(v); }
+      tapOverlay.classList.add('hidden');
+    });
+
     tile.appendChild(header);
     tile.appendChild(panes);
+    tile.appendChild(tapOverlay);
 
     videoGridEl.appendChild(tile);
 
     return tile;
+  }
+
+  function safePlay(video) {
+    if (!video) return;
+    // Delay play to ensure element is stable in DOM
+    setTimeout(() => {
+      if (!video.isConnected) return; // Element removed from DOM
+      const p = video.play();
+      if (p && typeof p.catch === 'function') {
+        p.catch(err => console.warn('[media] video.play blocked', err && (err.name + ': ' + err.message)));
+      }
+    }, 100);
+  }
+
+  function toggleMute(btn) {
+    if (!localStream) return;
+    const audioTracks = localStream.getAudioTracks();
+    if (audioTracks.length === 0) return;
+    const currentlyUnmuted = btn.dataset.state === 'unmuted';
+    audioTracks.forEach(t => t.enabled = !currentlyUnmuted);
+    btn.dataset.state = currentlyUnmuted ? 'muted' : 'unmuted';
+    btn.textContent = currentlyUnmuted ? 'Unmute' : 'Mute';
+  }
+
+  // Speaker/mic and audio unlocking helpers (top-level)
+  function toggleSpeaker(peerUserId, btn) {
+    const tile = document.querySelector(`.call-tile[data-user-id="${peerUserId}"]`);
+    if (!tile) return;
+    const audioEl = tile.querySelector('audio[data-kind="remote-audio"]');
+    if (!audioEl) return;
+    const muted = audioEl.muted;
+    audioEl.muted = !muted;
+    btn.textContent = audioEl.muted ? 'Speaker Off' : 'Speaker On';
+    if (!audioEl.muted) {
+      unlockAudio();
+      safePlay(audioEl);
+    }
+  }
+
+  function unlockAudio() {
+    try {
+      if (!audioCtx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) audioCtx = new AC();
+      }
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+      console.log('[media] audio context state:', audioCtx && audioCtx.state);
+    } catch (e) {
+      console.warn('[media] unlockAudio failed', e && (e.name + ': ' + e.message));
+    }
+  }
+
+  function attachAudioFallback(peerUserId, stream) {
+    if (!audioCtx) return;
+    try {
+      let node = peerAudioNodes.get(peerUserId);
+      if (node) {
+        // No standard replace on node; recreate to ensure binding
+        try { node.disconnect(); } catch(_){}
+        peerAudioNodes.delete(peerUserId);
+      }
+      const source = audioCtx.createMediaStreamSource(stream);
+      source.connect(audioCtx.destination);
+      peerAudioNodes.set(peerUserId, source);
+      console.log('[media] connected remote audio via WebAudio for', peerUserId);
+    } catch (e) {
+      console.warn('[media] attachAudioFallback error', e && (e.name + ': ' + e.message));
+    }
   }
 
   function deleteCallTile(peerUserId) {
@@ -189,25 +320,87 @@
     };
 
     pc.ontrack = (e) => {
-      let stream = remoteStreams.get(peerUserId);
-      if (!stream) {
-        stream = new MediaStream();
-        remoteStreams.set(peerUserId, stream);
-      }
-      stream.addTrack(e.track);
+      const fromStream = e.streams && e.streams[0];
       const tile = document.querySelector(`.call-tile[data-user-id="${peerUserId}"]`);
-      if (tile) {
-        const video = tile.querySelector('video[data-kind="remote"]');
-        if (video && video.srcObject !== stream) {
-          video.srcObject = stream;
-        }
+      if (!tile) return;
+      const video = tile.querySelector('video[data-kind="remote"]');
+      let audioEl = tile.querySelector('audio[data-kind="remote-audio"]');
+      if (!audioEl) {
+        audioEl = document.createElement('audio');
+        audioEl.autoplay = true;
+        audioEl.dataset.kind = 'remote-audio';
+        audioEl.controls = false;
+        audioEl.volume = 1.0;
+        audioEl.muted = false;
+        audioEl.style.display = 'none';
+        tile.appendChild(audioEl);
       }
+
+      if (fromStream) {
+        // Use the provided stream (includes both audio+video tracks)
+        if (video && video.srcObject !== fromStream) {
+          console.log('[webrtc] ontrack stream tracks', fromStream.getTracks().map(t => t.kind));
+          video.srcObject = fromStream;
+          if (audioEl) {
+            audioEl.srcObject = fromStream;
+            audioEl.muted = false; // Ensure not muted
+          }
+          if (video.readyState >= 1) safePlay(video);
+          if (audioEl) safePlay(audioEl);
+        }
+        attachAudioFallback(peerUserId, fromStream);
+      } else {
+        // Fallback: accumulate tracks into a single MediaStream
+        let stream = remoteStreams.get(peerUserId);
+        if (!stream) {
+          stream = new MediaStream();
+          remoteStreams.set(peerUserId, stream);
+        }
+        stream.addTrack(e.track);
+        if (video && video.srcObject !== stream) {
+          console.log('[webrtc] ontrack (fallback) track', e.track.kind);
+          video.srcObject = stream;
+          if (audioEl) {
+            audioEl.srcObject = stream;
+            audioEl.muted = false; // Ensure not muted
+          }
+          if (video.readyState >= 1) safePlay(video);
+          if (audioEl) safePlay(audioEl);
+        }
+        attachAudioFallback(peerUserId, stream);
+      }
+
+      // Rebind retry after a short delay in case the element was attached late
+      setTimeout(() => {
+        const t = document.querySelector(`.call-tile[data-user-id="${peerUserId}"]`);
+        if (!t) return;
+        const a = t.querySelector('audio[data-kind="remote-audio"]');
+        if (a && !a.srcObject) {
+          const src = fromStream || remoteStreams.get(peerUserId);
+          if (src) { a.srcObject = src; a.muted = false; safePlay(a); }
+        }
+      }, 200);
     };
 
     pc.onconnectionstatechange = () => {
       console.log('[webrtc] connectionState', peerUserId, pc.connectionState);
       if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
         endCall(peerUserId, 'connectionstate:' + pc.connectionState);
+      }
+      if (pc.connectionState === 'connected') {
+        // Force audio resume/play on successful connection
+        unlockAudio();
+        const tile = document.querySelector(`.call-tile[data-user-id="${peerUserId}"]`);
+        if (tile) {
+          const audioEl = tile.querySelector('audio[data-kind="remote-audio"]');
+          if (audioEl) safePlay(audioEl);
+          const videoEl = tile.querySelector('video[data-kind="remote"]');
+          if (videoEl) safePlay(videoEl);
+          // On mobile, show tap overlay to guarantee a user gesture
+          const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+          const overlay = tile.querySelector('.tap-to-start');
+          if (isMobile && overlay) overlay.classList.remove('hidden');
+        }
       }
     };
 
@@ -223,7 +416,10 @@
     const video = tile.querySelector('video[data-kind="local"]');
     try {
       const stream = await ensureLocalStream();
-      if (video && video.srcObject !== stream) video.srcObject = stream;
+      if (video && video.srcObject !== stream) {
+        video.srcObject = stream;
+        safePlay(video); // preview
+      }
     } catch (_) {
       // If user media is unavailable, we still allow receive-only calls.
       console.warn('[media] attachLocalStreamToTile: continuing without local media');
@@ -298,6 +494,7 @@
 
     acceptBtn.addEventListener('click', async () => {
       cleanup();
+      unlockAudio();
       await handleIncomingCall({ fromUserId, fromName, offer });
     });
     rejectBtn.addEventListener('click', () => {
@@ -315,6 +512,7 @@
       }
 
       const tile = ensureCallTile(peerUser);
+      unlockAudio();
       await attachLocalStreamToTile(tile);
 
       const pc = createPeerConnection(peerUser._id);
