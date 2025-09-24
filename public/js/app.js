@@ -22,6 +22,7 @@
   const peerAudioNodes = new Map(); // userId -> MediaStreamAudioSourceNode
   let audioCtx = null;
   const livekitRooms = new Map(); // userId -> LiveKit Room
+  const pendingCandidates = new Map(); // userId -> RTCIceCandidateInit[]
 
   // Ensure at least one user gesture unlocks audio context globally
   document.addEventListener('click', () => {
@@ -29,10 +30,12 @@
   }, { once: true });
 
   // Release media on page unload to allow other browsers to access devices
-  window.addEventListener('beforeunload', () => {
+  const unloadListener = () => {
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
     }
+  };
+  window.addEventListener('beforeunload', unloadListener);
 
   // ---------- LiveKit (optional) ----------
   function makeRoomName(a, b) {
@@ -110,7 +113,6 @@
 
     return true;
   }
-  });
 
   // SDP munging to improve latency and echo resilience
   function tuneSDP(sdp) {
@@ -874,6 +876,14 @@
       // Set remote first to establish transceivers reliably across browsers
       console.log('[webrtc] setRemoteDescription(offer) from', fromUserId);
       await pc.setRemoteDescription(offer);
+      // Flush any queued ICE candidates now that remote description is set
+      const queued = pendingCandidates.get(fromUserId);
+      if (queued && queued.length) {
+        for (const c of queued) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_){/* ignore */}
+        }
+        pendingCandidates.delete(fromUserId);
+      }
       await addLocalTracks(pc);
       let answer = await pc.createAnswer();
       // SDP munging for low-latency Opus/Video
@@ -893,6 +903,14 @@
       if (!pc) return;
       console.log('[webrtc] setRemoteDescription(answer) from', fromUserId);
       await pc.setRemoteDescription(answer);
+      // Flush queued ICE after setting remote description
+      const queued = pendingCandidates.get(fromUserId);
+      if (queued && queued.length) {
+        for (const c of queued) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(_){/* ignore */}
+        }
+        pendingCandidates.delete(fromUserId);
+      }
     } catch (e) {
       console.error('[call] handleCallAnswered error', e && (e.name + ': ' + e.message));
     }
@@ -902,7 +920,13 @@
     try {
       const pc = peers.get(fromUserId);
       if (!pc) return;
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      if (pc.remoteDescription && pc.remoteDescription.type) {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } else {
+        const list = pendingCandidates.get(fromUserId) || [];
+        list.push(candidate);
+        pendingCandidates.set(fromUserId, list);
+      }
     } catch (e) {
       console.error('[call] handleIceCandidate error', e && (e.name + ': ' + e.message));
     }
